@@ -1,0 +1,81 @@
+export const PAGE_SIZE = 24;
+
+/**
+ * Mengambil data ringkasan kartu statistik & opsi dropdown secara terpisah
+ */
+export async function fetchCatalogMeta(supabase) {
+  const { data, error } = await supabase.rpc("get_catalog_meta");
+
+  if (error) {
+    throw error;
+  }
+
+  const categories = Array.isArray(data?.categories) ? data.categories : [];
+  const brands = Array.isArray(data?.brands) ? data.brands : [];
+  const storages = Array.isArray(data?.storages) ? data.storages : [];
+
+  return {
+    totalProducts: Number(data?.total_products ?? 0),
+    activeCategoriesCount: categories.length,
+    activeBrandsCount: brands.length,
+    storageLocationsCount: storages.length,
+    categoryOptions: categories,
+    brandOptions: brands,
+    storageOptions: storages,
+  };
+}
+
+/**
+ * Mengambil daftar produk dengan paginasi (24 item/halaman) & filter di query
+ */
+export async function fetchCatalogProducts({
+  supabase,
+  page = 0,
+  search = "",
+  category = "ALL",
+  brand = "ALL",
+  storage = "ALL",
+}) {
+  const from = page * PAGE_SIZE;
+  const to = from + PAGE_SIZE - 1;
+
+  // Sesuaikan kolom gambar jika namanya berbeda (misalnya foto / gambar / image_url)
+  let query = supabase
+    .from("products")
+    .select("id, id_barang, nama, satuan, kategori, brand, penyimpanan", {
+      count: "exact",
+    });
+
+  if (category && category !== "ALL") {
+    query = query.eq("kategori", category);
+  }
+
+  if (brand && brand !== "ALL") {
+    query = query.eq("brand", brand);
+  }
+
+  if (storage && storage !== "ALL") {
+    query = query.eq("penyimpanan", storage);
+  }
+
+  if (search && search.trim() !== "") {
+    const keyword = search.trim();
+    query = query.or(`nama.ilike.%${keyword}%,id_barang.ilike.%${keyword}%`);
+  }
+
+  const { data, error, count } = await query
+    .order("id", { ascending: true })
+    .range(from, to);
+
+  if (error) {
+    throw error;
+  }
+
+  const totalFiltered = Number(count ?? 0);
+
+  return {
+    products: data ?? [],
+    totalFiltered,
+    hasMore: to + 1 < totalFiltered,
+  };
+}
