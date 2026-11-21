@@ -69,7 +69,7 @@
                 <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                     <div class="relative">
                         <i class="fa-solid fa-search absolute left-3 top-3 text-gray-400"></i>
-                        <input type="text" id="filter-search" placeholder="Cari nama produk / ID..." class="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-400 focus:border-gray-400" oninput="applyFilters()">
+                        <input type="text" id="filter-search" placeholder="Cari nama produk / ID..." class="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-gray-400 focus:border-gray-400" oninput="onSearchInput()">
                     </div>
                     <div>
                         <select id="filter-kategori" class="w-full px-4 py-2 border border-red-600 bg-red-500 text-white font-medium rounded-lg" onchange="applyFilters()">
@@ -92,9 +92,21 @@
                 </div>
             </div>
 
+            <!-- INFO JUMLAH TAMPIL -->
+            <div class="flex justify-between items-center mb-4 text-xs text-gray-500">
+                <span id="catalog-count-info">Menampilkan 0 produk</span>
+            </div>
+
             <!-- GRID PRODUK -->
             <div id="product-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 sm:gap-6"></div>
             
+            <!-- TOMBOL MUAT LEBIH BANYAK -->
+            <div id="load-more-container" class="hidden text-center mt-8">
+                <button type="button" id="btn-load-more" onclick="loadMoreProducts()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-6 py-2.5 rounded-lg shadow-sm transition cursor-pointer">
+                    Muat Lebih Banyak
+                </button>
+            </div>
+
             <div id="empty-state" class="hidden text-center py-20">
                 <i class="fa-solid fa-box-open text-6xl text-gray-300 mb-4"></i>
                 <p class="text-gray-500 text-lg">Belum ada produk yang ditemukan.</p>
@@ -369,19 +381,26 @@
 
     <script>
         // ========================================================
-        // KONFIGURASI SUPABASE (Ganti dengan URL & Anon Key Anda)
+        // KONFIGURASI SUPABASE & PAGINASI
         // ========================================================
         const SUPABASE_URL = 'https://tscpseomamagnzresesz.supabase.co';
         const SUPABASE_ANON_KEY = 'sb_publishable_SpUvyg_XAI8QtinK67lcEg_3KsgGI54';
+        const PAGE_SIZE = 24;
 
         let supabaseClient = null;
         let products = [
             { id: 'demo-1', id_barang: 'CH-001', nama: 'Contoh Sabun Cuci Piring 5L', satuan: 'Jerigen', kategori: 'CHEMICAL', brand: 'CLAVA', penyimpanan: 'SUHU RUANG', ketahanan: '12 Bulan', foto: '' },
             { id: 'demo-2', id_barang: 'FG-002', nama: 'Contoh Menu Signature Drink', satuan: 'Pcs', kategori: 'FINISHGOODS', brand: 'HONG TANG', penyimpanan: 'SUHU CHILLER', ketahanan: '3 Hari', foto: '' }
         ];
-        let filteredProducts = [];
+        let adminProducts = [];
+        let currentPage = 0;
+        let totalFilteredProducts = 0;
+        let hasMoreProducts = false;
+        let searchDebounceTimer = null;
+
         let globalCategories = ["CHEMICAL", "FINISHGOODS", "ONLINE", "PACKAGING", "RAW", "STICKER", "UTENSIL", "EQUIPMENT"];
         let globalBrands = ["HONG TANG", "CAFE CANTON", "CURRY HOUSE", "T'CHEW", "CLAVA"];
+        let globalStorages = ["SUHU RUANG", "SUHU CHILLER", "SUHU FROZEN"];
         let currentUser = null; 
         let activeCompressedBlob = null; 
         let bulkRowIndex = 0;
@@ -437,7 +456,7 @@
                 if (!SUPABASE_URL.includes('YOUR_SUPABASE_PROJECT')) {
                     supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
                 }
-                fetchData();
+                initCatalog();
             } catch(err) {
                 console.error("Supabase init error:", err);
             }
@@ -462,6 +481,12 @@
             filterBrand.innerHTML = `<option value="" class="bg-white text-gray-900">Semua Brand</option>` + 
                 globalBrands.map(b => `<option value="${b}" class="bg-white text-gray-900">${b}</option>`).join('');
             filterBrand.value = currentBrandVal;
+
+            const filterStorage = document.getElementById('filter-penyimpanan');
+            const currentStorageVal = filterStorage.value;
+            filterStorage.innerHTML = `<option value="" class="bg-white text-gray-900">Semua Penyimpanan</option>` + 
+                globalStorages.map(s => `<option value="${s}" class="bg-white text-gray-900">${s}</option>`).join('');
+            filterStorage.value = currentStorageVal;
 
             const formCat = document.getElementById('prod-category');
             const currentFormCat = formCat.value;
@@ -516,34 +541,140 @@
             customAlert(`Brand "${brandName}" berhasil ditambahkan!`);
         }
 
-        async function fetchData() {
-            if (SUPABASE_URL.includes('YOUR_SUPABASE_PROJECT') || !supabaseClient) {
-                updateMetaDropdowns();
-                applyFilters();
+        // ========================================================
+        // 1. AMBIL STATISTIK & OPSI DROPDOWN RINGAN (RPC)
+        // ========================================================
+        async function fetchCatalogMeta() {
+            if (!supabaseClient) return;
+            try {
+                const { data, error } = await supabaseClient.rpc('get_catalog_meta');
+                if (error) throw error;
+
+                if (data) {
+                    const cats = Array.isArray(data.categories) ? data.categories : [];
+                    const brands = Array.isArray(data.brands) ? data.brands : [];
+                    const storages = Array.isArray(data.storages) ? data.storages : [];
+
+                    if (cats.length > 0) globalCategories = [...new Set([...globalCategories, ...cats])].sort();
+                    if (brands.length > 0) globalBrands = [...new Set([...globalBrands, ...brands])].sort();
+                    if (storages.length > 0) globalStorages = [...new Set([...globalStorages, ...storages])];
+
+                    const pubTotal = document.getElementById('pub-stat-total');
+                    const pubKat = document.getElementById('pub-stat-kategori');
+                    const pubBrand = document.getElementById('pub-stat-brand');
+                    const pubStorage = document.getElementById('pub-stat-penyimpanan');
+
+                    if (pubTotal) pubTotal.innerText = Number(data.total_products ?? 0);
+                    if (pubKat) pubKat.innerText = cats.length || globalCategories.length;
+                    if (pubBrand) pubBrand.innerText = brands.length || globalBrands.length;
+                    if (pubStorage) pubStorage.innerText = storages.length || globalStorages.length;
+                }
+            } catch (e) {
+                console.error("Gagal memuat meta katalog:", e);
+            }
+        }
+
+        // ========================================================
+        // 2. AMBIL DAFTAR PRODUK BERPAGINASI (24 ITEM PER MUATAN)
+        // ========================================================
+        async function fetchCatalogProducts(page = 0, append = false) {
+            const search = document.getElementById('filter-search').value.trim();
+            const cat = document.getElementById('filter-kategori').value;
+            const brand = document.getElementById('filter-brand').value;
+            const storage = document.getElementById('filter-penyimpanan').value;
+
+            if (!supabaseClient) {
+                const filtered = products.filter(p => {
+                    const matchSearch = !search || p.nama.toLowerCase().includes(search.toLowerCase()) || (p.id_barang && p.id_barang.toLowerCase().includes(search.toLowerCase()));
+                    const matchCat = cat ? p.kategori === cat : true;
+                    const matchBrand = brand ? p.brand === brand : true;
+                    const matchStorage = storage ? p.penyimpanan === storage : true;
+                    return matchSearch && matchCat && matchBrand && matchStorage;
+                });
+                products = filtered;
+                totalFilteredProducts = filtered.length;
+                hasMoreProducts = false;
+                renderProducts();
                 return;
             }
-            showLoading(true, "Memuat data katalog...");
-            try {
-                const { data: prodData, error: prodErr } = await supabaseClient.from('products').select('*').order('created_at', { ascending: false });
-                if(prodErr) throw prodErr;
-                if(prodData) products = prodData;
 
-                const { data: catData } = await supabaseClient.from('categories').select('*');
-                if(catData && catData.length > 0) {
-                    globalCategories = [...new Set([...globalCategories, ...catData.map(c => c.name)])];
+            const from = page * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+
+            if (!append) {
+                showLoading(true, "Memuat data katalog...");
+            } else {
+                const btnMore = document.getElementById('btn-load-more');
+                if (btnMore) {
+                    btnMore.disabled = true;
+                    btnMore.innerText = "Memuat...";
                 }
-
-                const { data: brandData } = await supabaseClient.from('brands').select('*');
-                if(brandData && brandData.length > 0) {
-                    globalBrands = [...new Set([...globalBrands, ...brandData.map(b => b.name)])];
-                }
-
-                updateMetaDropdowns();
-                applyFilters();
-            } catch(e) {
-                console.error(e);
             }
-            showLoading(false);
+
+            try {
+                let query = supabaseClient
+                    .from('products')
+                    .select('id, id_barang, nama, satuan, kategori, brand, penyimpanan, ketahanan, foto', { count: 'exact' });
+
+                if (cat) query = query.eq('kategori', cat);
+                if (brand) query = query.eq('brand', brand);
+                if (storage) query = query.eq('penyimpanan', storage);
+                if (search) {
+                    query = query.or(`nama.ilike.%${search}%,id_barang.ilike.%${search}%`);
+                }
+
+                const { data, error, count } = await query
+                    .order('created_at', { ascending: false })
+                    .range(from, to);
+
+                if (error) throw error;
+
+                const rows = data ?? [];
+                products = append ? [...products, ...rows] : rows;
+                currentPage = page;
+                totalFilteredProducts = Number(count ?? 0);
+                hasMoreProducts = (to + 1) < totalFilteredProducts;
+
+                renderProducts();
+            } catch (e) {
+                console.error("Gagal memuat produk:", e);
+            } finally {
+                showLoading(false);
+                const btnMore = document.getElementById('btn-load-more');
+                if (btnMore) {
+                    btnMore.disabled = false;
+                    btnMore.innerText = "Muat Lebih Banyak";
+                }
+            }
+        }
+
+        async function initCatalog() {
+            if (!supabaseClient) {
+                updateMetaDropdowns();
+                renderProducts();
+                return;
+            }
+            await Promise.all([
+                fetchCatalogMeta(),
+                fetchCatalogProducts(0, false)
+            ]);
+            updateMetaDropdowns();
+        }
+
+        function onSearchInput() {
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(() => {
+                applyFilters();
+            }, 300);
+        }
+
+        function applyFilters() {
+            fetchCatalogProducts(0, false);
+        }
+
+        function loadMoreProducts() {
+            if (!hasMoreProducts) return;
+            fetchCatalogProducts(currentPage + 1, true);
         }
 
         function initBulkTable() {
@@ -659,16 +790,16 @@
                 if(supabaseClient) {
                     const { error } = await supabaseClient.from('products').insert(itemsToSave);
                     if(error) throw error;
-                    await fetchData();
+                    await initCatalog();
                 } else {
                     itemsToSave.forEach((item, idx) => {
                         products.unshift({ id: 'demo-' + Date.now() + idx, ...item });
                     });
+                    renderProducts();
                 }
                 closeModal('modal-bulk');
                 initBulkTable();
-                applyFilters();
-                renderAdminTable();
+                await renderAdminTable();
                 customAlert(`${itemsToSave.length} produk berhasil ditambahkan secara massal!`);
             } catch(e) {
                 customAlert("Gagal menyimpan data massal: " + e.message);
@@ -676,44 +807,39 @@
             showLoading(false);
         }
 
-        function applyFilters() {
-            const search = document.getElementById('filter-search').value.toLowerCase();
-            const cat = document.getElementById('filter-kategori').value;
-            const brand = document.getElementById('filter-brand').value;
-            const storage = document.getElementById('filter-penyimpanan').value;
-
-            filteredProducts = products.filter(p => {
-                const matchSearch = p.nama.toLowerCase().includes(search) || (p.id_barang && p.id_barang.toLowerCase().includes(search));
-                const matchCat = cat ? p.kategori === cat : true;
-                const matchBrand = brand ? p.brand === brand : true;
-                const matchStorage = storage ? p.penyimpanan === storage : true;
-                return matchSearch && matchCat && matchBrand && matchStorage;
-            });
-            renderProducts();
-            updateStats();
-        }
-
         function renderProducts() {
             const grid = document.getElementById('product-grid');
             const empty = document.getElementById('empty-state');
+            const loadMoreContainer = document.getElementById('load-more-container');
+            const countInfo = document.getElementById('catalog-count-info');
+
             grid.innerHTML = '';
+            if (countInfo) {
+                countInfo.innerText = `Menampilkan ${products.length} dari ${totalFilteredProducts || products.length} produk`;
+            }
             
-            if (filteredProducts.length === 0) {
+            if (products.length === 0) {
                 grid.classList.add('hidden');
                 empty.classList.remove('hidden');
+                if (loadMoreContainer) loadMoreContainer.classList.add('hidden');
                 return;
             }
             
             grid.classList.remove('hidden');
             empty.classList.add('hidden');
 
-            filteredProducts.forEach(p => {
+            if (loadMoreContainer) {
+                if (hasMoreProducts) loadMoreContainer.classList.remove('hidden');
+                else loadMoreContainer.classList.add('hidden');
+            }
+
+            products.forEach(p => {
                 const brandClass = getBrandBadgeClass(p.brand);
                 const safeImg = formatImageUrl(p.foto);
                 const card = `
                 <div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition group cursor-pointer flex flex-col h-full" onclick="showProductDetail('${p.id}')">
                     <div class="w-full bg-gray-100 relative overflow-hidden h-48 border-b border-gray-100 flex items-center justify-center">
-                        <img src="${safeImg}" alt="${p.nama}" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" onerror="this.src='https://placehold.co/300x300/e2e8f0/64748b?text=No+Image'">
+                        <img src="${safeImg}" alt="${p.nama}" loading="lazy" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" onerror="this.src='https://placehold.co/300x300/e2e8f0/64748b?text=No+Image'">
                         <span class="absolute top-2 left-2 ${brandClass} border px-2.5 py-1 text-xs rounded shadow-sm">${p.brand || '-'}</span>
                         <span class="absolute bottom-2 right-2 bg-gray-800/90 text-white px-2 py-1 text-xs font-bold rounded shadow-sm">${p.id_barang || '-'}</span>
                     </div>
@@ -732,29 +858,34 @@
             });
         }
 
-        function updateStats() {
-            const pubTotal = document.getElementById('pub-stat-total');
-            const pubKat = document.getElementById('pub-stat-kategori');
-            const pubBrand = document.getElementById('pub-stat-brand');
-            const pubStorage = document.getElementById('pub-stat-penyimpanan');
-
-            if (pubTotal) pubTotal.innerText = products.length;
-            if (pubKat) pubKat.innerText = new Set(products.map(p => p.kategori)).size;
-            if (pubBrand) pubBrand.innerText = new Set(products.map(p => p.brand)).size;
-            if (pubStorage) pubStorage.innerText = new Set(products.map(p => p.penyimpanan)).size;
-        }
-
-        function renderAdminTable() {
+        async function renderAdminTable() {
             const tbody = document.getElementById('admin-product-table');
+            tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-8 text-center text-sm text-gray-500">Memuat data admin...</td></tr>';
+
+            let listForAdmin = products;
+            if (supabaseClient) {
+                try {
+                    const { data, error } = await supabaseClient
+                        .from('products')
+                        .select('id, id_barang, nama, satuan, kategori, brand, penyimpanan, ketahanan, foto')
+                        .order('created_at', { ascending: false });
+                    if (!error && data) {
+                        adminProducts = data;
+                        listForAdmin = data;
+                    }
+                } catch (err) {
+                    console.error("Gagal memuat tabel admin:", err);
+                }
+            }
+
             tbody.innerHTML = '';
-            
-            products.forEach(p => {
+            listForAdmin.forEach(p => {
                 const brandClass = getBrandBadgeClass(p.brand);
                 const safeImg = formatImageUrl(p.foto);
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td class="px-6 py-4 whitespace-nowrap">
-                        <img src="${safeImg}" class="h-12 w-12 rounded-lg object-cover border border-gray-200 shadow-sm" alt="img" onerror="this.src='https://placehold.co/300x300/e2e8f0/64748b?text=No'">
+                        <img src="${safeImg}" loading="lazy" class="h-12 w-12 rounded-lg object-cover border border-gray-200 shadow-sm" alt="img" onerror="this.src='https://placehold.co/300x300/e2e8f0/64748b?text=No'">
                     </td>
                     <td class="px-6 py-4">
                         <div class="text-sm font-bold text-gray-900 mb-1">${p.nama}</div>
@@ -780,8 +911,12 @@
             });
         }
 
+        function findProductById(id) {
+            return products.find(x => String(x.id) === String(id)) || adminProducts.find(x => String(x.id) === String(id));
+        }
+
         function showProductDetail(id) {
-            const p = products.find(x => x.id === id);
+            const p = findProductById(id);
             if (!p) return;
             
             const isAdmin = currentUser && currentUser.role === 'admin';
@@ -896,7 +1031,6 @@
 
         async function uploadImageToSupabaseStorage(blob) {
             if (!supabaseClient) {
-                // Return local object URL if running demo mode
                 return URL.createObjectURL(blob);
             }
             const fileName = `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.jpg`;
@@ -921,13 +1055,13 @@
                 if(supabaseClient) {
                     const { error } = await supabaseClient.from('products').update({ foto: publicUrl }).eq('id', id);
                     if(error) throw error;
-                    await fetchData();
+                    await fetchCatalogProducts(0, false);
                 } else {
-                    const p = products.find(x => x.id === id);
+                    const p = findProductById(id);
                     if(p) p.foto = publicUrl;
                 }
 
-                if(!document.getElementById('view-admin').classList.contains('hidden')) renderAdminTable();
+                if(!document.getElementById('view-admin').classList.contains('hidden')) await renderAdminTable();
                 closeModal('modal-detail');
                 customAlert("Foto berhasil diperbarui!");
             } catch (err) {
@@ -947,7 +1081,7 @@
             
             if(id) {
                 title.innerText = "Edit Produk";
-                const p = products.find(x => x.id === id);
+                const p = findProductById(id);
                 if(p) {
                     document.getElementById('prod-id').value = p.id;
                     document.getElementById('prod-id-barang').value = p.id_barang || '';
@@ -1000,19 +1134,19 @@
                         const { error } = await supabaseClient.from('products').insert([payload]);
                         if(error) throw error;
                     }
-                    await fetchData();
+                    await initCatalog();
                 } else {
                     if(id) {
-                        const p = products.find(x => x.id === id);
+                        const p = findProductById(id);
                         if(p) Object.assign(p, payload);
                     } else {
                         products.unshift({ id: 'demo-' + Date.now(), ...payload });
                     }
-                    applyFilters();
+                    renderProducts();
                 }
 
                 closeModal('modal-product');
-                renderAdminTable();
+                await renderAdminTable();
                 customAlert("Produk berhasil disimpan!");
             } catch(err) {
                 customAlert("Gagal menyimpan data: " + err.message);
@@ -1027,12 +1161,12 @@
                     if(supabaseClient) {
                         const { error } = await supabaseClient.from('products').delete().eq('id', id);
                         if(error) throw error;
-                        await fetchData();
+                        await initCatalog();
                     } else {
                         products = products.filter(p => p.id !== id);
-                        applyFilters();
+                        renderProducts();
                     }
-                    renderAdminTable();
+                    await renderAdminTable();
                 } catch(e) {
                     customAlert("Gagal menghapus produk: " + e.message);
                 }
@@ -1053,7 +1187,6 @@
             if(supabaseClient) {
                 showLoading(true, "Memeriksa kredensial...");
                 try {
-                    // Coba login via Supabase Auth (untuk akun yang dibuat di menu Authentication Supabase)
                     const { data: authData, error: authError } = await supabaseClient.auth.signInWithPassword({
                         email: u,
                         password: p
@@ -1065,7 +1198,6 @@
                         return;
                     }
 
-                    // Jika tidak ketemu di Auth, coba cek tabel kustom 'admins'
                     const { data: adminData, error: adminError } = await supabaseClient
                         .from('admins')
                         .select('*')
@@ -1085,7 +1217,7 @@
                 }
             } else {
                 showLoading(false);
-                    customAlert("Username atau Password salah.");
+                customAlert("Username atau Password salah.");
             }
         }
 
